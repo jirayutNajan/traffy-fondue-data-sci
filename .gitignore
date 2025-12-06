@@ -1,0 +1,4 @@
+DE/airflow_pipeline_/data/*.csv
+DE/airflow_pipeline_/logs
+
+.vscode/
