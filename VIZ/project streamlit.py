@@ -5,6 +5,18 @@ from datetime import datetime, timedelta
 import plotly.express as px
 import pydeck as pdk
 import pickle
+import joblib
+import warnings
+warnings.filterwarnings('ignore')
+
+# Import ML libraries that might be needed for unpickling
+try:
+    from sklearn.preprocessing import StandardScaler, LabelEncoder
+    from sklearn.pipeline import Pipeline
+    from xgboost import XGBClassifier
+    import xgboost
+except ImportError as e:
+    st.warning(f"⚠️ Missing ML library: {e}. Some features may not work.")
 
 # =========================================================
 # 0. Setup & Helper Functions
@@ -18,25 +30,114 @@ def load_model():
     """โหลดไฟล์ Model (.pkl)"""
     try:
         # ตรวจสอบชื่อไฟล์โมเดลของคุณให้ถูกต้อง
-        with open('traffy_model_weather.pkl', 'rb') as f:
-            return pickle.load(f)
+        # Use joblib instead of pickle for better compatibility with sklearn/xgboost objects
+        return joblib.load('traffy_model_weather.pkl')
     except FileNotFoundError:
+        st.warning("⚠️ ไม่พบไฟล์ 'traffy_model_weather.pkl' - ตรวจสอบให้แน่ใจว่าไฟล์อยู่ในไดเรกทอรี่เดียวกับ script นี้")
+        return None
+    except (pickle.UnpicklingError, ModuleNotFoundError, AttributeError) as e:
+        st.error(f"❌ เกิดข้อผิดพลาดในการโหลดโมเดล: {type(e).__name__}: {e}")
+        st.info("💡 ความช่วยเหลือ: โปรดติดตั้งไลบรารีต่อไปนี้:")
+        st.code("pip install scikit-learn xgboost pandas numpy joblib", language="bash")
+        return None
+    except Exception as e:
+        st.error(f"❌ เกิดข้อผิดพลาดที่ไม่คาดคิด: {type(e).__name__}: {e}")
         return None
 
 def preprocess_for_prediction(df, model_pkg):
     """
-    [IMPORTANT] ฟังก์ชันจำลองการเตรียมข้อมูล
-    **คุณต้องนำ Logic การดึงสภาพอากาศ หรือ Feature Engineering ของจริงมาใส่ตรงนี้**
+    [IMPORTANT] ฟังก์ชันการเตรียมข้อมูลสำหรับการทำนาย
+    เตรียมข้อมูลให้ตรงกับรูปแบบที่โมเดล XGBoost ต้องการ
+    รวมการ Encode คอลัมน์เชิงหมวดหมู่ และสร้าง Time Features
     """
-    # Return ค่าเพื่อทดสอบระบบ (ถ้ามี Pipeline ใน model_pkg ให้ใช้ transform)
-    if model_pkg and 'preprocessor' in model_pkg:
+    from sklearn.preprocessing import LabelEncoder
+    
+    # สำเนา DataFrame เพื่อไม่แก้ไขข้อมูลต้นฉบับ
+    df_processed = df.copy()
+    
+    # ====== Step 1: Create Time Features from Timestamp ======
+    if 'timestamp' in df_processed.columns:
         try:
-            return model_pkg['preprocessor'].transform(df)
-        except:
-            pass
+            df_processed['timestamp'] = pd.to_datetime(df_processed['timestamp'], errors='coerce')
+            df_processed['hour'] = df_processed['timestamp'].dt.hour
+            df_processed['day_of_week'] = df_processed['timestamp'].dt.dayofweek
+            df_processed['month'] = df_processed['timestamp'].dt.month
+        except Exception as e:
+            st.warning(f"⚠️ ไม่สามารถแตก timestamp: {e}")
+    
+    # ====== Step 2: Create Text Features ======
+    if 'comment' in df_processed.columns:
+        df_processed['comment_len'] = df_processed['comment'].astype(str).apply(len)
+    else:
+        df_processed['comment_len'] = 0
+    
+    # ====== Step 3: Encode Categorical Columns ======
+    cols_to_encode = ['district', 'subdistrict', 'type 1']
+    org_col = 'organization_1' if 'organization_1' in df_processed.columns else 'organization'
+    if org_col in df_processed.columns:
+        cols_to_encode.append(org_col)
+    
+    # ใช้ Encoders จากโมเดล หรือสร้างใหม่
+    if model_pkg and 'encoders' in model_pkg:
+        encoders_dict = model_pkg['encoders']
+    else:
+        encoders_dict = {}
+    
+    for col in cols_to_encode:
+        if col in df_processed.columns:
+            # เติม Unknown สำหรับค่าว่าง
+            df_processed[col] = df_processed[col].fillna('Unknown').astype(str)
             
-    # กรณีไม่มี Logic: ส่งค่าเดิมกลับไป (อาจ Error ถ้าโมเดลต้องการ input ที่แปลงแล้ว)
-    return df 
+            # ถ้ามี Encoder จากโมเดล ให้ใช้นั้น
+            if col in encoders_dict:
+                try:
+                    # Handle unknown categories (from prediction data)
+                    le = encoders_dict[col]
+                    # ถ้าค่าไม่อยู่ใน encoder ให้ assign 0
+                    df_processed[f'{col}_enc'] = df_processed[col].map(
+                        lambda x: le.transform([x])[0] if x in le.classes_ else 0
+                    )
+                except Exception as e:
+                    st.warning(f"⚠️ ไม่สามารถ encode {col}: {e}")
+                    df_processed[f'{col}_enc'] = 0
+            else:
+                # สร้าง Encoder ใหม่ (ถ้าไม่มีจากโมเดล)
+                le = LabelEncoder()
+                try:
+                    df_processed[f'{col}_enc'] = le.fit_transform(df_processed[col])
+                except Exception as e:
+                    st.warning(f"⚠️ ไม่สามารถ encode {col}: {e}")
+                    df_processed[f'{col}_enc'] = 0
+    
+    # ====== Step 4: Select Only Required Features ======
+    # รายชื่อ Feature ที่โมเดลคาดหวัง (จากการ Train)
+    required_features = [
+        'district_enc', 'subdistrict_enc', 'type 1_enc', 
+        'organization_1_enc', 'comment_len', 
+        'hour', 'day_of_week', 'month'
+    ]
+    
+    # ถ้าโมเดล มีข้อมูล feature ที่ต้องการ ให้ใช้นั้น
+    if model_pkg and 'features' in model_pkg:
+        required_features = model_pkg['features']
+    
+    # สร้าง DataFrame ที่มี Feature ที่ต้องการเท่านั้น
+    X = pd.DataFrame()
+    for feat in required_features:
+        if feat in df_processed.columns:
+            X[feat] = df_processed[feat]
+        else:
+            # ถ้า Feature หาไม่เจอ ให้เติม 0
+            X[feat] = 0
+    
+    # ====== Step 5: Handle Missing Values ======
+    X = X.fillna(0)
+    
+    # ====== Step 6: Ensure Correct Order & Data Types ======
+    for col in X.columns:
+        X[col] = pd.to_numeric(X[col], errors='coerce').fillna(0)
+    
+    return X 
 
 # โหลดโมเดลเตรียมไว้
 model_package = load_model()
@@ -503,6 +604,25 @@ if 'count_reopen' in analysis_df.columns:
     )
     fig_reopen.update_layout(xaxis_title="จำนวนครั้งที่เปิดซ้ำ", yaxis_title="จำนวนเรื่อง")
     st.plotly_chart(fig_reopen, use_container_width=True)
+
+# 3.1 กราฟ Top 5 Types with Most Reopen Count
+if 'count_reopen' in analysis_df.columns and 'type 1' in analysis_df.columns:
+    # Get top 5 types by total reopen count
+    type_reopen = analysis_df.groupby('type 1')['count_reopen'].sum().nlargest(5).reset_index()
+    type_reopen.columns = ['type', 'total_reopen']
+    
+    fig_top5_reopen = px.bar(
+        type_reopen, 
+        x='type', 
+        y='total_reopen', 
+        title="🏆 Top 5 ประเภทปัญหาที่เปิดซ้ำมากที่สุด (Top 5 Problem Types by Reopen Count)",
+        color='total_reopen',
+        color_continuous_scale='Reds',
+        labels={'type': 'ประเภทปัญหา (Problem Type)', 'total_reopen': 'รวมจำนวนครั้งที่เปิดซ้ำ'}
+    )
+    fig_top5_reopen.update_xaxes(tickangle=-45)
+    fig_top5_reopen.update_layout(showlegend=False)
+    st.plotly_chart(fig_top5_reopen, use_container_width=True)
 
 st.markdown("---")
 
