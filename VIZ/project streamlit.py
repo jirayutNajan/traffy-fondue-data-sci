@@ -513,7 +513,6 @@ if 'type 1' in analysis_df.columns:
     if analysis_df['type 1'].notna().sum() > 0:
         problem_type_counts = analysis_df['type 1'].value_counts().reset_index()
         problem_type_counts.columns = ['type', 'count']
-        
         fig_type = px.bar(
             problem_type_counts, 
             x='type', 
