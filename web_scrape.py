@@ -1,19 +1,16 @@
 # %%
 import pandas as pd
 
-df_downloaded = pd.read_csv("clean_data2.csv")
+df_downloaded = pd.read_csv("/opt/airflow/data/clean_data2.csv")
 
 # %%
-
-# %%
-df = df_downloaded.sample(100000)
+df = df_downloaded.head(100000)
 
 # %% [markdown]
 # # scape condo
 
 # %%
 import requests
-import pandas as pd
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -139,8 +136,6 @@ else:
 # # scape สภาพอากาศ
 
 # %%
-import requests
-import pandas as pd
 
 def get_historical_weather(start_date, end_date, lat=13.7563, lon=100.5018):
     """
@@ -171,33 +166,32 @@ def get_historical_weather(start_date, end_date, lat=13.7563, lon=100.5018):
 
 def map_weather_condition(code):
     """
-    แปลง WMO Weather Code เป็น 4 กลุ่มหลัก:
-    - ฟ้าใส (default)
-    - ฝนตก (เฉพาะปานกลางถึงหนัก)
-    - พายุฝน
-    - หมอก
+    แปลง WMO Weather Code เป็น 5 กลุ่มหลักตามโจทย์
     """
-
-    # หมอก
-    if code in [45, 48]:
+    # Group 1: ฟ้าใส / แดดออก
+    if code in [0]:
+        return "ฟ้าใส"
+    # Group 2: มีเมฆ (บางส่วน หรือ มาก)
+    elif code in [1, 2, 3]:
+        return "มีเมฆ"
+    # Group 3: หมอก (จัดเป็นกลุ่มอื่นๆ หรือรวมกับเมฆก็ได้)
+    elif code in [45, 48]:
         return "หมอก"
-
-    # ฝนตก (ปานกลางถึงหนักเท่านั้น)
-    # 63 = ฝนปานกลาง, 65 = ฝนหนัก
-    # 81 = ฝน shower ปานกลาง, 82 = ฝน shower หนัก
-    if code in [63, 65, 81, 82]:
+    # Group 4: ฝนตก (ละอองฝน, ฝนตกหนัก, ฝนเยือกแข็ง)
+    elif code in [51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82]:
         return "ฝนตก"
-
-    # พายุฝนฟ้าคะนอง
-    if code in [95, 96, 99]:
+    # Group 5: พายุ / หิมะ (รวมหิมะไว้เผื่อกรณีต่างประเทศ แต่ไทยหลักๆ คือพายุ)
+    elif code in [95, 96, 99]:
         return "พายุฝน"
+    # กรณีอื่นๆ (เช่น หิมะ code 71-77)
+    else:
+        return "อื่นๆ"
 
-    # default = ฟ้าใส
-    return "ฟ้าใส"
+# --- การใช้งาน ---
 
 # 1. กำหนดวันและดึงข้อมูล
-start = "2021-09-03"
-end = "2025-01-16"
+start = "2021-09-19"
+end = "2022-06-08"
 
 # ดึงข้อมูล (ตัวอย่างพิกัด กรุงเทพฯ)
 df_weather = get_historical_weather(start, end)
@@ -244,8 +238,6 @@ target_df.head()
 # ==============================================================================
 # DATA PIPELINE (FIXED): Scrape Bangkok Population with Headers
 # ==============================================================================
-import pandas as pd
-import requests
 
 # 1. Scrape Data from Wikipedia (with Headers)
 print("1. Scraping population data from Wikipedia...")
@@ -333,14 +325,9 @@ target_df.head()
 # # scape ราคา condo/ตรม
 
 # %%
-import requests
-import pandas as pd
 import json
 from typing import List, Dict
 import time
-import numpy as np
-import cloudscraper
-import random
 
 # Set up headers to mimic a browser request
 headers = {
@@ -401,20 +388,19 @@ district_mapping = {
     'TH1012': 'ยานนาวา',
 }
 
-import cloudscraper
-
 def fetch_ddproperty_all_districts(max_pages_per_district: int = 2) -> pd.DataFrame:
-    all_listings = []
-    base_url = "https://www.ddproperty.com/_next/data/Ea7XSXCxje9p33n-MOlyw/%E0%B8%A3%E0%B8%A7%E0%B8%A1%E0%B8%9B%E0%B8%A3%E0%B8%B0%E0%B8%81%E0%B8%B2%E0%B8%A8%E0%B8%82%E0%B8%B2%E0%B8%A2.json"
+    """
+    Scrape condo data from all Bangkok districts using districtCode
     
-    # สร้าง scraper ที่หลบ Cloudflare ได้
-    scraper = cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'mobile': False
-        }
-    )
+    Parameters:
+    - max_pages_per_district: Maximum number of pages to scrape per district (default: 2)
+    
+    Returns:
+    - DataFrame with columns: [ชื่อ condo, latitude, longitude, ราคา, ตารางเมตร, ราคาต่อตารางเมตร, เขต, ชื่อเขต]
+    """
+    
+    all_listings = []
+    base_url = "https://www.ddproperty.com/_next/data/SJdltGT3KUQnE_Gt6T1yQ/%E0%B8%A3%E0%B8%A7%E0%B8%A1%E0%B8%9B%E0%B8%A3%E0%B8%B0%E0%B8%81%E0%B8%B2%E0%B8%A8%E0%B8%82%E0%B8%B2%E0%B8%A2.json"
     
     district_codes = list(district_mapping.keys())
     total_districts = len(district_codes)
@@ -433,12 +419,12 @@ def fetch_ddproperty_all_districts(max_pages_per_district: int = 2) -> pd.DataFr
                 }
                 
                 print(f"  Fetching page {page}...", end=' ')
-                response = scraper.get(base_url, params=params, timeout=15)
+                response = requests.get(base_url, params=params, headers=headers, timeout=10)
                 response.raise_for_status()
                 
                 data = response.json()
                 
-                # ส่วนที่เหลือเหมือนเดิม...
+                # Extract listings from the correct location in the API response
                 page_data = data['pageProps'].get('pageData', {})
                 listings_data = page_data.get('data', {})
                 listings = listings_data.get('listingsData', [])
@@ -448,6 +434,7 @@ def fetch_ddproperty_all_districts(max_pages_per_district: int = 2) -> pd.DataFr
                 for listing in listings:
                     listing_data = listing.get('listingData', {})
                     
+                    # Extract price per area from the pricePerArea field
                     price_per_area_str = listing_data.get('pricePerArea', {}).get('localeStringValue', '')
                     price_per_sqm = None
                     if price_per_area_str:
@@ -456,7 +443,9 @@ def fetch_ddproperty_all_districts(max_pages_per_district: int = 2) -> pd.DataFr
                         except:
                             pass
                     
+                    # Extract area (ตารางเมตร) from media carousel or other fields
                     area_sqm = None
+                    # Try to extract from mediaCarousel if available
                     media_carousel = listing_data.get('mediaCarousel', {})
                     if isinstance(media_carousel, dict):
                         carousel_items = media_carousel.get('items', [])
@@ -469,13 +458,14 @@ def fetch_ddproperty_all_districts(max_pages_per_district: int = 2) -> pd.DataFr
                                     except:
                                         pass
                     
+                    # Calculate price per sqm from price and area if not provided
                     if price_per_sqm is None and listing_data.get('price', {}).get('value') and area_sqm:
                         price_per_sqm = listing_data.get('price', {}).get('value') / area_sqm
                     
                     item = {
                         'ชื่อ condo': listing_data.get('localizedTitle'),
-                        'latitude': np.nan,
-                        'longitude': np.nan,
+                        'latitude': np.nan,  # Not available in this API
+                        'longitude': np.nan,  # Not available in this API
                         'ราคา': listing_data.get('price', {}).get('value'),
                         'ตารางเมตร': area_sqm,
                         'ราคาต่อตารางเมตร': price_per_sqm,
@@ -485,14 +475,24 @@ def fetch_ddproperty_all_districts(max_pages_per_district: int = 2) -> pd.DataFr
                     
                     all_listings.append(item)
                 
-                time.sleep(random.uniform(2, 4))  # เพิ่ม random delay
+                # Be respectful - add delay between requests
+                time.sleep(1)
                 
-            except Exception as e:
+            except requests.exceptions.RequestException as e:
                 print(f"  Error: {e}")
-                time.sleep(5)
                 continue
     
+    # Create DataFrame with specified column order
     df = pd.DataFrame(all_listings)
+    
+    # Ensure all columns exist in the correct order
+    columns_order = ['ชื่อ condo', 'latitude', 'longitude', 'ราคา', 'ตารางเมตร', 'ราคาต่อตารางเมตร', 'เขต', 'ชื่อเขต']
+    for col in columns_order:
+        if col not in df.columns:
+            df[col] = np.nan
+    
+    df = df[columns_order]
+    
     return df
 
 # Fetch the data
@@ -565,6 +565,6 @@ print("First 5 rows of target_df with new 'avg_price_per_sqm' column:")
 target_df.head()
 
 # %%
-target_df.to_csv('scrape.csv', index=True, encoding='utf-8')
+target_df.to_csv('/opt/airflow/data/scrape.csv', index=True, encoding='utf-8')
 
 
