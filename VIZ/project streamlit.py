@@ -39,19 +39,19 @@ REQUIRED_COLS_CONFIG = {
 @st.cache_data
 def load_raw_data():
     try:
-        return pd.read_csv('merged_data.csv')
+        return pd.read_csv('scrape.csv')
     except FileNotFoundError:
         try:
-            return pd.read_csv('clean_data2.csv')
+            return pd.read_csv('scrape.csv')
         except FileNotFoundError:
             return pd.DataFrame()
 
 raw_df = load_raw_data()
 
 @st.cache_data
-def cload_cluster_df():
-    return pd.read_csv("clustered_df.csv")
-clusterd_df = cload_cluster_df()
+def load_cluster_df():
+    return pd.read_csv("clusterd_df.csv")
+clusterd_df = load_cluster_df()
 
 if raw_df.empty:
     st.error("❌ ไม่พบไฟล์ข้อมูลหลัก (merged_data.csv หรือ clean_data2.csv)")
