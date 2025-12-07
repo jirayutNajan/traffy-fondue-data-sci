@@ -4,9 +4,42 @@ import numpy as np
 from datetime import datetime, timedelta
 import plotly.express as px
 import pydeck as pdk
+import pickle
 
-# ตั้งค่าหน้าเว็บ
+# =========================================================
+# 0. Setup & Helper Functions
+# =========================================================
+
+# ตั้งค่าหน้าเว็บ (ต้องบรรทัดแรกสุดของ Streamlit command)
 st.set_page_config(page_title="Traffy Fondue Explorer (Auto Map)", layout="wide")
+
+@st.cache_resource
+def load_model():
+    """โหลดไฟล์ Model (.pkl)"""
+    try:
+        # ตรวจสอบชื่อไฟล์โมเดลของคุณให้ถูกต้อง
+        with open('traffy_model_weather.pkl', 'rb') as f:
+            return pickle.load(f)
+    except FileNotFoundError:
+        return None
+
+def preprocess_for_prediction(df, model_pkg):
+    """
+    [IMPORTANT] ฟังก์ชันจำลองการเตรียมข้อมูล
+    **คุณต้องนำ Logic การดึงสภาพอากาศ หรือ Feature Engineering ของจริงมาใส่ตรงนี้**
+    """
+    # Return ค่าเพื่อทดสอบระบบ (ถ้ามี Pipeline ใน model_pkg ให้ใช้ transform)
+    if model_pkg and 'preprocessor' in model_pkg:
+        try:
+            return model_pkg['preprocessor'].transform(df)
+        except:
+            pass
+            
+    # กรณีไม่มี Logic: ส่งค่าเดิมกลับไป (อาจ Error ถ้าโมเดลต้องการ input ที่แปลงแล้ว)
+    return df 
+
+# โหลดโมเดลเตรียมไว้
+model_package = load_model()
 
 st.title("🚦 Traffy Fondue Analytics (Cluster & Heatmap & Prediction)")
 
@@ -19,7 +52,7 @@ REQUIRED_COLS_CONFIG = {
     'ticket_id': 'รหัสเรื่อง (ID)',
     'comment': 'รายละเอียดปัญหา',
     'organization_1': 'หน่วยงาน (Organization)',
-    'organization_2': 'หน่วยงาน (Organization)', # เผื่อกรณีไฟล์มีหลาย format
+    'organization_2': 'หน่วยงาน (Organization)', 
     'organization_3': 'หน่วยงาน (Organization)',
     'type 1': 'ประเภทปัญหา (Type)',
     'type 2': 'ประเภทปัญหา (Type)',
@@ -33,32 +66,33 @@ REQUIRED_COLS_CONFIG = {
     'state': 'สถานะ (State)',
     'latitude': 'ละติจูด (Latitude)',
     'longitude': 'ลองจิจูด (Longitude)',
-    'cluster': 'กลุ่ม (Cluster)'
+    'cluster': 'กลุ่ม (Cluster)',
+    'coords': 'coords',
+    'สภาพอากาศ': 'สภาพอากาศ',
+    'dist_to_nearest_condo': 'dist_to_nearest_condo_km',
+    'avg_price_per_sqm': 'avg_price_per_sqm'
 }
 
 @st.cache_data
 def load_raw_data():
-    try:
-        return pd.read_csv('scrape.csv')
-    except FileNotFoundError:
-        try:
-            return pd.read_csv('scrape.csv')
-        except FileNotFoundError:
-            return pd.DataFrame()
+    return pd.read_csv('scrape.csv')
 
 raw_df = load_raw_data()
 
 @st.cache_data
-def load_cluster_df():
-    return pd.read_csv("clusterd_df.csv")
-clusterd_df = load_cluster_df()
+def cload_cluster_df():
+    try:
+        return pd.read_csv("clustered_df.csv")
+    except:
+        return pd.DataFrame()
+clusterd_df = cload_cluster_df()
 
 if raw_df.empty:
     st.error("❌ ไม่พบไฟล์ข้อมูลหลัก (merged_data.csv หรือ clean_data2.csv)")
     st.stop()
 
 # =========================================================
-# 1.1 Auto Mapping Logic (แทนที่ UI เดิม)
+# 1.1 Auto Mapping Logic
 # =========================================================
 
 # เตรียม Dictionary สำหรับเปลี่ยนชื่อ และเก็บรายชื่อคอลัมน์ที่เจอ
@@ -68,11 +102,9 @@ found_cols = []
 # ลูปตรวจสอบคอลัมน์ตาม Config
 for internal_name, csv_header in REQUIRED_COLS_CONFIG.items():
     if csv_header in raw_df.columns:
-        # กรณี 1: เจอชื่อภาษาไทยเป๊ะๆ ใน CSV -> สั่งเปลี่ยนชื่อ
         rename_dict[csv_header] = internal_name
         found_cols.append(internal_name)
     elif internal_name in raw_df.columns:
-        # กรณี 2: CSV ถูกเปลี่ยนชื่อมาแล้ว หรือชื่อตรงกับภาษาอังกฤษอยู่แล้ว -> ใช้ได้เลย
         found_cols.append(internal_name)
 
 # ทำการเปลี่ยนชื่อคอลัมน์
@@ -100,7 +132,7 @@ if 'timestamp' in df.columns:
              df['timestamp'] = df['timestamp'].dt.tz_localize(None)
 
 # แปลงตัวเลข (สำคัญมากสำหรับ Map)
-for col in ['latitude', 'longitude', 'star', 'count_reopen', 'cluster']:
+for col in ['latitude', 'longitude', 'star', 'count_reopen', 'cluster', 'dist_to_nearest_condo', 'avg_price_per_sqm']:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
@@ -108,10 +140,7 @@ for col in ['latitude', 'longitude', 'star', 'count_reopen', 'cluster']:
 # 2. Sidebar Filters
 # =========================================================
 st.sidebar.header("🔍 ตัวเลือกการค้นหา (สำหรับส่วนที่ 1 & 2)")
-
-# --- ส่วนตั้งค่าแผนที่ ---
 st.sidebar.markdown("---")
-# ---------------------------------------------
 
 if df.empty:
     st.error("ไม่เหลือข้อมูลหลังจากประมวลผล")
@@ -120,7 +149,6 @@ if df.empty:
 # Filter Input
 n_sample = st.sidebar.slider("1. จำนวนรายการ (Sample)", 1, 10000, min(1000, len(df)))
 
-# ใช้ get เพื่อกัน Error กรณีคอลัมน์ไม่มี
 org_options = []
 if 'organization_1' in df.columns: 
     org_options = df['organization_1'].dropna().unique()
@@ -136,32 +164,61 @@ reopen_range = st.sidebar.slider("4. จำนวนเปิดซ้ำ", 0, m
 
 star_range = st.sidebar.slider("5. คะแนน (Star)", 0, 5, (0, 5))
 
+# Weather filter
+weather_options = []
+if 'สภาพอากาศ' in df.columns:
+    weather_options = df['สภาพอากาศ'].dropna().unique()
+selected_weather = st.sidebar.multiselect("6. สภาพอากาศ", weather_options)
+
+# Distance to condo filter
+if 'dist_to_nearest_condo' in df.columns and df['dist_to_nearest_condo'].notna().sum() > 0:
+    min_dist = float(df['dist_to_nearest_condo'].min())
+    max_dist = float(df['dist_to_nearest_condo'].max())
+    dist_range = st.sidebar.slider("7. ระยะห่างจากคอนโดใกล้สุด (km)", min_dist, max_dist, (min_dist, max_dist), step=0.1)
+else:
+    dist_range = None
+
+# Average price per sqm filter
+if 'avg_price_per_sqm' in df.columns and df['avg_price_per_sqm'].notna().sum() > 0:
+    min_price = float(df['avg_price_per_sqm'].min())
+    max_price = float(df['avg_price_per_sqm'].max())
+    price_range = st.sidebar.slider("8. ราคาเฉลี่ยต่อตร.ม. (บาท)", min_price, max_price, (min_price, max_price), step=1000.0)
+else:
+    price_range = None
+
 if 'timestamp' in df.columns and not df['timestamp'].isna().all():
     min_date = df['timestamp'].min()
     max_date = df['timestamp'].max()
 else:
     min_date = datetime.now()
     max_date = datetime.now()
-    
-date_range = st.sidebar.date_input("6. วันที่", [min_date, max_date])
 
-selected_prov = st.sidebar.multiselect("7. จังหวัด", df['province'].dropna().unique() if 'province' in df.columns else [])
-selected_dist = st.sidebar.multiselect("8. เขต/อำเภอ", df['district'].dropna().unique() if 'district' in df.columns else [])
-selected_sub = st.sidebar.multiselect("9. แขวง/ตำบล", df['subdistrict'].dropna().unique() if 'subdistrict' in df.columns else [])
-selected_state = st.sidebar.multiselect("10. สถานะ", df['state'].dropna().unique() if 'state' in df.columns else [])
+default_date = pd.to_datetime('2022-05-24').date()
+date_range = st.sidebar.date_input("9. วันที่", [default_date, max_date])
+
+selected_prov = st.sidebar.multiselect("10. จังหวัด", df['province'].dropna().unique() if 'province' in df.columns else [])
+selected_dist = st.sidebar.multiselect("11. เขต/อำเภอ", df['district'].dropna().unique() if 'district' in df.columns else [])
+selected_sub = st.sidebar.multiselect("12. แขวง/ตำบล", df['subdistrict'].dropna().unique() if 'subdistrict' in df.columns else [])
+selected_state = st.sidebar.multiselect("13. สถานะ", df['state'].dropna().unique() if 'state' in df.columns else [])
 
 # =========================================================
-# NEW SIDEBAR SECTION: Prediction Settings
+# Sidebar: Prediction Settings
 # =========================================================
 st.sidebar.markdown("---")
-st.sidebar.header("🔮 ตัวเลือกแผนที่ทำนาย (สำหรับส่วนที่ 3)")
+st.sidebar.header("🔮 ตัวเลือกแผนที่ทำนาย (สำหรับส่วนที่ 4)")
+
+uploaded_file = st.sidebar.file_uploader("📂 อัปโหลดไฟล์ CSV เพื่อทำนาย", type=['csv'])
+run_prediction = st.sidebar.button("🚀 เริ่มทำนายผล (Predict)")
+
 n_pred_sample = st.sidebar.slider("1. จำนวนรายการทำนาย (Pred Sample)", 1, 20000, 2000, help="จำนวนจุดที่จะแสดงบนแผนที่ความเสี่ยง")
 pred_dot_size = st.sidebar.slider("2. ขนาดจุดสูงสุด (Max Dot Size)", 5, 50, 15, help="ขนาดสูงสุดของวงกลมความเสี่ยง")
 
 # --- Filtering Logic ---
 filtered_df = df.copy()
+# Keep original clusterd_df unfiltered for cluster section
+clusterd_df_for_cluster = clusterd_df.copy()
 
-# Filter Organization (รองรับหลายคอลัมน์ถ้ามี)
+# Filter Organization
 if selected_org:
     org_conditions = False
     if 'organization_1' in filtered_df.columns:
@@ -174,7 +231,7 @@ if selected_org:
     if isinstance(org_conditions, pd.Series):
         filtered_df = filtered_df[org_conditions]
 
-# Filter Type (รองรับหลายคอลัมน์ถ้ามี)
+# Filter Type (applies to 2.1, 2.2, maps only)
 if selected_type:
     type_conditions = False
     if 'type 1' in filtered_df.columns:
@@ -187,49 +244,72 @@ if selected_type:
     if isinstance(type_conditions, pd.Series):
         filtered_df = filtered_df[type_conditions]
 
-    if 'first_type' in clusterd_df.columns:
-        clusterd_df = clusterd_df[clusterd_df['first_type'].isin(selected_type)]
-
-
+# Filter Numeric/Date
 if 'count_reopen' in filtered_df.columns:
     filtered_df = filtered_df[filtered_df['count_reopen'].between(reopen_range[0], reopen_range[1])]
-    clusterd_df = clusterd_df[clusterd_df['count_reopen'].between(reopen_range[0], reopen_range[1])]
+
 if 'star' in filtered_df.columns:
     filtered_df = filtered_df[filtered_df['star'].between(star_range[0], star_range[1])]
+
+# Filter Weather (only for 2.1, 2.2 - NOT cluster)
+if selected_weather and 'สภาพอากาศ' in filtered_df.columns:
+    filtered_df = filtered_df[filtered_df['สภาพอากาศ'].isin(selected_weather)]
+
+# Filter Distance to Condo (only for 2.1, 2.2 - NOT cluster)
+if dist_range is not None and 'dist_to_nearest_condo' in filtered_df.columns:
+    filtered_df = filtered_df[filtered_df['dist_to_nearest_condo'].between(dist_range[0], dist_range[1])]
+
+# Filter Average Price per sqm (only for 2.1, 2.2 - NOT cluster)
+if price_range is not None and 'avg_price_per_sqm' in filtered_df.columns:
+    filtered_df = filtered_df[filtered_df['avg_price_per_sqm'].between(price_range[0], price_range[1])]
 
 if 'timestamp' in filtered_df.columns and isinstance(date_range, tuple) and len(date_range) == 2:
     start_date = pd.to_datetime(date_range[0])
     end_date = pd.to_datetime(date_range[1]) + timedelta(days=1) - timedelta(seconds=1)
     filtered_df = filtered_df[(filtered_df['timestamp'] >= start_date) & (filtered_df['timestamp'] <= end_date)]
 
-if selected_prov: filtered_df = filtered_df[filtered_df['province'].isin(selected_prov)]
+# Filter Location/State (applies to both)
+if selected_prov: 
+    filtered_df = filtered_df[filtered_df['province'].isin(selected_prov)]
+    if 'province' in clusterd_df_for_cluster.columns:
+        clusterd_df_for_cluster = clusterd_df_for_cluster[clusterd_df_for_cluster['province'].isin(selected_prov)]
 
-if selected_dist: filtered_df = filtered_df[filtered_df['district'].isin(selected_dist)]
-if selected_dist: clusterd_df = clusterd_df[clusterd_df['district'].isin(selected_dist)]
+if selected_dist: 
+    filtered_df = filtered_df[filtered_df['district'].isin(selected_dist)]
+    if 'district' in clusterd_df_for_cluster.columns:
+        clusterd_df_for_cluster = clusterd_df_for_cluster[clusterd_df_for_cluster['district'].isin(selected_dist)]
 
-if selected_sub: filtered_df = filtered_df[filtered_df['subdistrict'].isin(selected_sub)]
+if selected_sub: 
+    filtered_df = filtered_df[filtered_df['subdistrict'].isin(selected_sub)]
+    if 'subdistrict' in clusterd_df_for_cluster.columns:
+        clusterd_df_for_cluster = clusterd_df_for_cluster[clusterd_df_for_cluster['subdistrict'].isin(selected_sub)]
 
-if selected_state: filtered_df = filtered_df[filtered_df['state'].isin(selected_state)]
-if selected_state: clusterd_df = clusterd_df[clusterd_df['state'].isin(selected_state)]
+if selected_state: 
+    filtered_df = filtered_df[filtered_df['state'].isin(selected_state)]
+    if 'state' in clusterd_df_for_cluster.columns:
+        clusterd_df_for_cluster = clusterd_df_for_cluster[clusterd_df_for_cluster['state'].isin(selected_state)]
 
 # แยก Dataframe
-plot_df = filtered_df
+# analysis_df = ใช้สำหรับกราฟ 2.1 และ 2.2 (รับ filter ทั้งหมด)
+analysis_df = filtered_df.copy()
+# display_df = ใช้สำหรับแผนที่และตาราง (จำกัดด้วย sample)
 display_df = filtered_df.head(n_sample)
-clusterd_df_display = clusterd_df.head(n_sample)
+# Use clusterd_df_for_cluster for cluster section (only location filters)
+clusterd_df = clusterd_df_for_cluster.copy()
+clusterd_df_display = clusterd_df_for_cluster.head(n_sample)
 
-st.markdown(f"**จำนวนข้อมูลทั้งหมดที่พบ (Filter):** {len(plot_df):,} รายการ | **แสดงผล:** {len(display_df):,} รายการ")
+st.markdown(f"**จำนวนข้อมูลทั้งหมดที่พบ (Filter):** {len(analysis_df):,} รายการ | **แสดงผล:** {len(display_df):,} รายการ")
 st.markdown("---")
 
 # =========================================================
-# 3. Visualization (Separated Maps - Original)
+# 3. Visualization (Maps)
 # =========================================================
 
 st.header("1. แผนที่พิกัดและความหนาแน่น (Map Visualization)")
 
-# กรองเอาเฉพาะที่มีพิกัดจริงเท่านั้น (ห้ามว่าง ห้าม NaN)
+# กรองเอาเฉพาะที่มีพิกัดจริงเท่านั้น
 if 'latitude' in display_df.columns and 'longitude' in display_df.columns:
     map_data = display_df.dropna(subset=['latitude', 'longitude'])
-    # กรองค่า 0 ออก
     map_data = map_data[(map_data['latitude'] != 0) & (map_data['longitude'] != 0)]
 else:
     map_data = pd.DataFrame()
@@ -238,7 +318,6 @@ if not map_data.empty:
     mid_lat = map_data['latitude'].mean()
     mid_lon = map_data['longitude'].mean()
 
-    # View State เริ่มต้น
     view_state = pdk.ViewState(
         latitude=mid_lat,
         longitude=mid_lon,
@@ -246,7 +325,6 @@ if not map_data.empty:
         pitch=0,
     )
 
-    # สร้าง Tabs แยกกัน
     tab_scatter, tab_heat, tab_cluster = st.tabs(["📍 Scatter Plot (แผนที่จุด)", "🔥 Heatmap (แผนที่ความร้อน)", "Cluster (แผนที่แบ่งกลุ่ม)"])
 
     # ---------------- TAB 1: SCATTER ----------------
@@ -269,7 +347,6 @@ if not map_data.empty:
             radius_max_pixels=10,
         )
 
-        # สร้าง Tooltip HTML แบบ Dynamic (เช็คว่ามีคอลัมน์ไหนบ้าง)
         tooltip_fields = []
         if 'ticket_id' in map_data.columns: tooltip_fields.append("<b>ID:</b> {ticket_id}")
         if 'type 1' in map_data.columns: tooltip_fields.append("<b>Type:</b> {type 1}")
@@ -309,359 +386,415 @@ if not map_data.empty:
             initial_view_state=view_state
         ))
 
+    # ---------------- TAB 3: CLUSTER ----------------
     with tab_cluster:
         def get_color(cluster_id):
-            if cluster_id == 1:
-                return [255, 0, 0, 200]    # สีแดง (Cluster 1)
-            elif cluster_id == 2:
-                return [0, 255, 0, 200]    # สีเขียว (Cluster 2)
-            elif cluster_id == 3:
-                return [0, 0, 255, 200]    # สีน้ำเงิน (Cluster 3)
-            else:
-                return [165, 3, 252, 200] # สีเทา (อื่นๆ)
+            if cluster_id == 1: return [255, 0, 0, 200]    
+            elif cluster_id == 2: return [0, 255, 0, 200]    
+            elif cluster_id == 3: return [0, 0, 255, 200]    
+            else: return [165, 3, 252, 200] 
 
-        # สร้างคอลัมน์สีใหม่ใน DataFrame
-        clusterd_df_display['color'] = clusterd_df_display['cluster'].apply(get_color)
+        if not clusterd_df_display.empty and 'cluster' in clusterd_df_display.columns:
+            clusterd_df_display['color'] = clusterd_df_display['cluster'].apply(get_color)
 
-        # 3. กำหนดมุมมองเริ่มต้นของแผนที่
-        view_state = pdk.ViewState(
-            latitude=clusterd_df_display['latitude'].mean(),
-            longitude=clusterd_df_display['longitude'].mean(),
-            zoom=11,
-            pitch=0
-        )
+            view_state = pdk.ViewState(
+                latitude=clusterd_df_display['latitude'].mean(),
+                longitude=clusterd_df_display['longitude'].mean(),
+                zoom=11,
+                pitch=0
+            )
 
-        # 4. สร้าง Scatterplot Layer
-        scatterplot_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=clusterd_df_display,
-            get_position='[longitude, latitude]',
-            get_fill_color='color',      # ใช้คอลัมน์สีที่เราสร้าง
-            get_radius=200,              # รัศมีของจุด (หน่วยเป็นเมตร)
-            radius_min_pixels=5,         # ขนาดต่ำสุดบนหน้าจอ
-            radius_max_pixels=50,
-            pickable=True,               # สำคัญมาก! ต้อง True ถึงจะแสดง Tooltip ได้
-            opacity=0.8,
-            stroked=True,
-            filled=True
-        )
+            scatterplot_layer = pdk.Layer(
+                "ScatterplotLayer",
+                data=clusterd_df_display,
+                get_position='[longitude, latitude]',
+                get_fill_color='color',      
+                get_radius=200,              
+                radius_min_pixels=5,         
+                radius_max_pixels=50,
+                pickable=True,               
+                opacity=0.8,
+                stroked=True,
+                filled=True
+            )
 
-        # 5. กำหนดหน้าตา Tooltip
-        tooltip = {
-            "html": "<b>เขต:</b> {district} <br/>"
-                    "<b>Cluster:</b> {cluster} <br/>"
-                    "<b>ปัญหา:</b> {first_type} <br/>"
-                    "<b>สถานะ:</b> {state} <br/>"
-                    "<b>Reopen:</b> {count_reopen}",
-            "style": {
-                "backgroundColor": "steelblue",
-                "color": "white"
+            tooltip = {
+                "html": "<b>เขต:</b> {district} <br/>"
+                        "<b>Cluster:</b> {cluster} <br/>"
+                        "<b>ปัญหา:</b> {first_type} <br/>"
+                        "<b>สถานะ:</b> {state} <br/>"
+                        "<b>Reopen:</b> {count_reopen}",
+                "style": {
+                    "backgroundColor": "steelblue",
+                    "color": "white"
+                }
             }
-        }
 
-        st.caption("แผนที่แสดงจุดตามกลุ่ม (Cluster)")
-
-        # 6. แสดงผล
-        st.pydeck_chart(pdk.Deck(
-            initial_view_state=view_state,
-            layers=[scatterplot_layer],
-            tooltip=tooltip
-        ))
-
+            st.caption("แผนที่แสดงจุดตามกลุ่ม (Cluster)")
+            st.pydeck_chart(pdk.Deck(
+                initial_view_state=view_state,
+                layers=[scatterplot_layer],
+                tooltip=tooltip
+            ))
+        else:
+            st.info("ยังไม่มีข้อมูล Cluster ในส่วนนี้")
 
 else:
     st.warning("⚠️ ไม่พบข้อมูลพิกัด (Latitude/Longitude) หรือข้อมูลเป็น 0 ในไฟล์หลัก")
     
 st.markdown("---")
 
-st.header("2. สถิติและการกระจายตัว")
+# =========================================================
+# 2. Statistics & Distribution (Updated for Sliders)
+# =========================================================
+
+st.header("2. สถิติและการกระจายตัว (Distribution Analysis)")
+
+# --- ส่วนที่ 2.1: กราฟที่ตอบสนองกับ Slider (Date, Star, Reopen) ---
+st.subheader("2.1 การกระจายตัวตามตัวกรอง (Slider Filters)")
+st.subheader(f"จำนวน ticket ทั้งหมด{filtered_df.shape[0]}")
+st.caption("แสดงผลตามช่วงวันที่, คะแนน และจำนวนการเปิดซ้ำที่เลือก")
+
+col_slide1, col_slide2 = st.columns(2)
+
+# 1. กราฟ Time Series (จาก Date Range Slider)
+with col_slide1:
+    if 'timestamp' in analysis_df.columns:
+        # Create time series data for line chart
+        time_series = analysis_df.groupby(analysis_df['timestamp'].dt.date).size().reset_index(name='count')
+        time_series.columns = ['timestamp', 'count']
+        
+        fig_time = px.line(
+            time_series, 
+            x='timestamp', 
+            y='count',
+            title="📈 ปริมาณเรื่องร้องเรียนตามช่วงเวลา (Time Distribution)",
+            markers=True,
+            color_discrete_sequence=['#00CC96']
+        )
+        fig_time.update_layout(xaxis_title="วันที่", yaxis_title="จำนวนเรื่อง", hovermode='x unified')
+        st.plotly_chart(fig_time, use_container_width=True)
+    else:
+        st.info("ไม่พบข้อมูลวันเวลา (timestamp)")
+
+# 2. กราฟ Star (จาก Star Slider)
+with col_slide2:
+    if 'star' in analysis_df.columns:
+        fig_star = px.histogram(
+            analysis_df, 
+            x='star', 
+            title="⭐ การกระจายตัวของคะแนน (Star Distribution)",
+            nbins=11, 
+            range_x=[-0.5, 5.5],
+            color_discrete_sequence=['#FFD700']
+        )
+        fig_star.update_layout(xaxis_title="คะแนน (Star)", yaxis_title="จำนวนเรื่อง", bargap=0.2)
+        st.plotly_chart(fig_star, use_container_width=True)
+    else:
+        st.info("ไม่พบข้อมูลคะแนน (star)")
+
+# 3. กราฟ Reopen (จาก Reopen Slider)
+if 'count_reopen' in analysis_df.columns:
+    fig_reopen = px.histogram(
+        analysis_df, 
+        x='count_reopen', 
+        title="🔄 จำนวนการเปิดซ้ำ (Reopen Count Distribution)",
+        color_discrete_sequence=['#EF553B']
+    )
+    fig_reopen.update_layout(xaxis_title="จำนวนครั้งที่เปิดซ้ำ", yaxis_title="จำนวนเรื่อง")
+    st.plotly_chart(fig_reopen, use_container_width=True)
+
+st.markdown("---")
+
+# --- ส่วนที่ 2.2: กราฟประเภทปัญหา ---
+st.subheader("2.2 การกระจายตัวของประเภทปัญหา (Problem Type Distribution)")
+
+if 'type 1' in analysis_df.columns:
+    if analysis_df['type 1'].notna().sum() > 0:
+        problem_type_counts = analysis_df['type 1'].value_counts().reset_index()
+        problem_type_counts.columns = ['type', 'count']
+        
+        fig_type = px.bar(
+            problem_type_counts, 
+            x='type', 
+            y='count', 
+            title="ประเภทปัญหา (Problem Type)",
+            color='count',
+            color_continuous_scale='Viridis',
+            labels={'type': 'ประเภทปัญหา', 'count': 'จำนวนเรื่อง'}
+        )
+        fig_type.update_xaxes(tickangle=-45)
+        fig_type.update_layout(showlegend=False)
+        st.plotly_chart(fig_type, use_container_width=True)
+    else:
+        st.info("ไม่พบข้อมูลประเภทปัญหา")
+
+st.markdown("---")
+
+# --- ส่วนที่ 2.3: กราฟหมวดหมู่อื่นๆ ---
+st.subheader("2.3 สถิติตามหมวดหมู่พื้นฐาน")
 
 col1, col2 = st.columns(2)
-target_cols = ['subdistrict', 'district', 'province', 'state', 'star', 'count_reopen']
+other_cols = ['subdistrict', 'district', 'province', 'state', 'สภาพอากาศ'] 
 
-for i, col_name in enumerate(target_cols):
+for i, col_name in enumerate(other_cols):
     with (col1 if i % 2 == 0 else col2):
-        if col_name in plot_df.columns:
-            if plot_df[col_name].notna().sum() > 0:
+        if col_name in analysis_df.columns:
+            if analysis_df[col_name].notna().sum() > 0:
+                top_values = analysis_df[col_name].value_counts().nlargest(15).index
+                filtered_chart_df = analysis_df[analysis_df[col_name].isin(top_values)]
+                
                 fig = px.histogram(
-                    plot_df, 
+                    filtered_chart_df, 
                     x=col_name, 
-                    title=f"การกระจายตัวของ {col_name}",
+                    title=f"การกระจายตัวของ {col_name} (Top 15)",
                     color_discrete_sequence=['#636EFA']
                 )
+                fig.update_xaxes(tickangle=-45)
                 st.plotly_chart(fig, use_container_width=True)
 
-st.markdown("---")
+# Additional numeric distributions
+st.subheader("2.4 การกระจายตัวของข้อมูลเชิงตัวเลข")
+col3, col4 = st.columns(2)
+
+with col3:
+    if 'dist_to_nearest_condo' in analysis_df.columns and analysis_df['dist_to_nearest_condo'].notna().sum() > 0:
+        fig_dist = px.histogram(
+            analysis_df, 
+            x='dist_to_nearest_condo', 
+            title="📍 การกระจายระยะห่างจากคอนโดใกล้สุด (km)",
+            color_discrete_sequence=['#AB63FA'],
+            nbins=30
+        )
+        fig_dist.update_layout(xaxis_title="ระยะห่าง (km)", yaxis_title="จำนวนเรื่อง")
+        st.plotly_chart(fig_dist, use_container_width=True)
+
+with col4:
+    if 'avg_price_per_sqm' in analysis_df.columns and analysis_df['avg_price_per_sqm'].notna().sum() > 0:
+        fig_price = px.histogram(
+            analysis_df, 
+            x='avg_price_per_sqm', 
+            title="💰 การกระจายราคาเฉลี่ยต่อตารางเมตร (บาท)",
+            color_discrete_sequence=['#FFA15A'],
+            nbins=30
+        )
+        fig_price.update_layout(xaxis_title="ราคาเฉลี่ย (บาท/ตร.ม.)", yaxis_title="จำนวนเรื่อง")
+        st.plotly_chart(fig_price, use_container_width=True)
 
 st.markdown("---")
+
+
 
 # =========================================================
-# NEW SECTION: Cluster Analysis (Updated with Count Chart)
+# 3. Cluster Analysis
 # =========================================================
 st.header("3. การวิเคราะห์กลุ่มปัญหา (Cluster Analysis)")
 
-# ตรวจสอบว่ามีคอลัมน์ Cluster หรือไม่
-# ใช้ plot_df ที่ผ่านการ filter มาแล้ว
 if 'cluster' in clusterd_df.columns:
-    # แปลง Cluster เป็น String เพื่อให้สีแยกกันชัดเจน (Discrete Color)
     cluster_data = clusterd_df.copy()
     cluster_data['cluster'] = cluster_data['cluster'].astype(str)
     
-    # เรียงลำดับชื่อ Cluster (เพื่อให้กราฟเรียงสวยงาม 0, 1, 2...)
     unique_clusters = sorted([c for c in cluster_data['cluster'].unique() if c != 'nan' and c != 'None'], key=lambda x: int(float(x)) if x.replace('.','',1).isdigit() else x)
 
-    # -------------------------------------------------------
-    # 3.1 จำนวนเรื่องทั้งหมดในแต่ละ Cluster (เพิ่มใหม่ตามขอ)
-    # -------------------------------------------------------
+    # 3.1 จำนวนเรื่องทั้งหมดในแต่ละ Cluster
     st.subheader("3.1 จำนวนเรื่องทั้งหมดในแต่ละ Cluster")
-
-    # นับจำนวน
     total_counts = cluster_data.groupby('cluster').size().reset_index(name='count')
-    
-    # เรียงลำดับตาม Cluster ID
     total_counts = total_counts.sort_values('cluster', key=lambda col: col.map(lambda x: int(float(x)) if x.replace('.','',1).isdigit() else x))
     
     fig_total = px.bar(
-        total_counts, 
-        x='cluster', 
-        y='count', 
-        color='cluster',
-        title="จำนวนเรื่องทั้งหมด แบ่งตาม Cluster",
-        labels={'cluster': 'Cluster', 'count': 'จำนวนเรื่อง'},
-        text_auto=True
+        total_counts, x='cluster', y='count', color='cluster',
+        title="จำนวนเรื่องทั้งหมด แบ่งตาม Cluster", labels={'cluster': 'Cluster', 'count': 'จำนวนเรื่อง'}, text_auto=True
     )
     st.plotly_chart(fig_total, use_container_width=True)
 
-    # -------------------------------------------------------
-    # 3.2 Barchart ของ State (แบบ Grouped & Percentage) [Fix Logic]
-    # -------------------------------------------------------
+    # 3.2 สัดส่วนสถานะการดำเนินงาน
     st.subheader("3.2 สัดส่วนสถานะการดำเนินงาน (คิดเป็น % ของแต่ละ Cluster)")
-    
-    # 1. นับจำนวน State แยกตาม Cluster
     state_cluster_counts = cluster_data.groupby(['state', 'cluster']).size().reset_index(name='count')
-
-    # 2. คำนวณ Total ของแต่ละ Cluster (หาผลรวม count ของ cluster นั้นๆ)
     total_cluster_counts = state_cluster_counts.groupby('cluster')['count'].sum().reset_index(name='total_cluster_count')
-
-    # 3. Merge ข้อมูล total กลับเข้ามาในตารางหลัก
     state_cluster_counts = pd.merge(state_cluster_counts, total_cluster_counts, on='cluster')
-
-    # 4. คำนวณ % (จำนวนใน state / จำนวนรวมใน cluster * 100)
     state_cluster_counts['percentage'] = (state_cluster_counts['count'] / state_cluster_counts['total_cluster_count']) * 100
     
-    # 5. สร้างกราฟ
     fig_state_cluster = px.bar(
-        state_cluster_counts, 
-        x="state", 
-        y="percentage",  
-        color="cluster",
+        state_cluster_counts, x="state", y="percentage", color="cluster",
         title="สัดส่วนสถานะการดำเนินงาน (% เทียบภายใน Cluster ตัวเอง)",
-        labels={
-            "state": "สถานะ", 
-            "percentage": "สัดส่วน (%)", 
-            "cluster": "Cluster",
-            "count": "จำนวนเรื่อง",
-            "total_cluster_count": "จำนวนรวมในกลุ่ม"
-        },
-        barmode='group', 
-        text_auto='.1f', 
-        hover_data={'total_cluster_count': True, 'count': True, 'percentage': ':.2f'}
+        labels={"state": "สถานะ", "percentage": "สัดส่วน (%)", "cluster": "Cluster"},
+        barmode='group', text_auto='.1f'
     )
-    
     fig_state_cluster.update_layout(yaxis_ticksuffix="%")
     st.plotly_chart(fig_state_cluster, use_container_width=True)
 
-    # -------------------------------------------------------
-    # 3.3 Barchart ค่าเฉลี่ย Count Reopen
-    # -------------------------------------------------------
+    # 3.3 Average Reopen
     st.subheader("3.3 ค่าเฉลี่ยการเปิดซ้ำ (Average Reopen) ราย Cluster")
-    
     if 'count_reopen' in cluster_data.columns:
         avg_reopen = cluster_data.groupby('cluster')['count_reopen'].mean().reset_index()
         avg_reopen = avg_reopen.sort_values('cluster', key=lambda col: col.map(lambda x: int(float(x)) if x.replace('.','',1).isdigit() else x))
 
-        fig_reopen = px.bar(
-            avg_reopen,
-            x='cluster',
-            y='count_reopen',
-            color='cluster',
+        fig_reopen_bar = px.bar(
+            avg_reopen, x='cluster', y='count_reopen', color='cluster',
             title="ค่าเฉลี่ยจำนวนการเปิดซ้ำ (Reopen) ของแต่ละ Cluster",
-            labels={'cluster': 'Cluster', 'count_reopen': 'จำนวนเปิดซ้ำเฉลี่ย'},
-            text_auto='.2f'
+            labels={'cluster': 'Cluster', 'count_reopen': 'จำนวนเปิดซ้ำเฉลี่ย'}, text_auto='.2f'
         )
-        st.plotly_chart(fig_reopen, use_container_width=True)
+        st.plotly_chart(fig_reopen_bar, use_container_width=True)
 
-    # -------------------------------------------------------
-    # 3.4 รายละเอียด Top 3 ของแต่ละ Cluster (Type & District)
-    # -------------------------------------------------------
+    # 3.4 Top 3
     st.subheader("3.4 รายละเอียด Top 3 ปัญหา และ เขต ของแต่ละ Cluster")
-    
     if len(unique_clusters) > 0:
-        # --- ส่วนแสดง Top 3 Type 1 ---
         st.markdown("##### 📌 Top 3 ประเภทปัญหา (First Type)")
         cols_type = st.columns(len(unique_clusters)) 
-        
         for i, cluster_id in enumerate(unique_clusters):
             with cols_type[i]:
                 subset = cluster_data[cluster_data['cluster'] == cluster_id]
-                # เช็คทั้ง type 1 และ first_type เพื่อความชัวร์
                 col_type_name = 'type 1' if 'type 1' in subset.columns else 'first_type'
                 
                 if col_type_name in subset.columns:
                     top_types = subset[col_type_name].value_counts().nlargest(3).reset_index()
                     top_types.columns = ['type', 'count']
-                    
-                    fig_type = px.bar(
-                        top_types, x='type', y='count',
-                        title=f"Cluster {cluster_id}", text_auto=True,
-                        color_discrete_sequence=['#FF7F0E']
-                    )
+                    fig_type = px.bar(top_types, x='type', y='count', title=f"Cluster {cluster_id}", text_auto=True, color_discrete_sequence=['#FF7F0E'])
                     fig_type.update_layout(xaxis_title=None, yaxis_title=None, margin=dict(l=10, r=10, t=40, b=10))
                     st.plotly_chart(fig_type, use_container_width=True)
 
-        # --- ส่วนแสดง Top 3 District ---
         st.markdown("##### 🏙️ Top 3 เขต (District)")
         cols_dist = st.columns(len(unique_clusters)) 
-        
         for i, cluster_id in enumerate(unique_clusters):
             with cols_dist[i]:
                 subset = cluster_data[cluster_data['cluster'] == cluster_id]
                 if 'district' in subset.columns:
                     top_dists = subset['district'].value_counts().nlargest(3).reset_index()
                     top_dists.columns = ['district', 'count']
-                    
-                    fig_dist = px.bar(
-                        top_dists, x='district', y='count',
-                        title=f"Cluster {cluster_id}", text_auto=True,
-                        color_discrete_sequence=['#2CA02C']
-                    )
+                    fig_dist = px.bar(top_dists, x='district', y='count', title=f"Cluster {cluster_id}", text_auto=True, color_discrete_sequence=['#2CA02C'])
                     fig_dist.update_layout(xaxis_title=None, yaxis_title=None, margin=dict(l=10, r=10, t=40, b=10))
                     st.plotly_chart(fig_dist, use_container_width=True)
 
-    # -------------------------------------------------------
-    # 3.5 Top 3 ปัญหา (First Type) แยกกราฟเฉพาะ (ตามที่ขอเพิ่ม)
-    # -------------------------------------------------------
+    # 3.5 Top 3 Problem Specific
     st.subheader("3.5 สรุปปัญหาที่พบบ่อยที่สุด (First Type) แยกตาม Cluster")
-    
-    # ใช้ logic เดียวกับด้านบนแต่แยกส่วนออกมา
-    col_problem_name = 'type 1' # Default
-    if 'first_type' in cluster_data.columns:
-        col_problem_name = 'first_type'
-    elif 'type 1' in cluster_data.columns:
-        col_problem_name = 'type 1'
-        
+    col_problem_name = 'first_type' if 'first_type' in cluster_data.columns else 'type 1'
     if len(unique_clusters) > 0 and col_problem_name in cluster_data.columns:
         cols = st.columns(len(unique_clusters))
-        
         for i, cluster_id in enumerate(unique_clusters):
             with cols[i]:
                 subset = cluster_data[cluster_data['cluster'] == cluster_id]
-                
                 top_problems = subset[col_problem_name].value_counts().nlargest(3).reset_index()
                 top_problems.columns = ['first_type', 'count']
-                
-                fig_prob = px.bar(
-                    top_problems,
-                    x='first_type',
-                    y='count',
-                    title=f"<b>Cluster {cluster_id}</b>",
-                    text_auto=True,
-                    color_discrete_sequence=['#FF5733'],
-                    height=350
-                )
-                
-                fig_prob.update_layout(
-                    xaxis_title=None, 
-                    yaxis_title=None, 
-                    margin=dict(l=10, r=10, t=40, b=10),
-                    showlegend=False
-                )
+                fig_prob = px.bar(top_problems, x='first_type', y='count', title=f"<b>Cluster {cluster_id}</b>", text_auto=True, color_discrete_sequence=['#FF5733'], height=350)
+                fig_prob.update_layout(xaxis_title=None, yaxis_title=None, margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
                 st.plotly_chart(fig_prob, use_container_width=True)
 
 else:
     st.info("ℹ️ ไม่พบคอลัมน์ 'cluster' ในข้อมูล จึงไม่สามารถแสดงการวิเคราะห์กลุ่มได้")
 
+st.markdown("---")
+
 # =========================================================
-# 5. NEW SECTION: Reopen Risk Visualization
+# 4. PREDICTION LOGIC
 # =========================================================
 st.header("4. แผนที่ความเสี่ยงการเปิดซ้ำ (Reopen Risk Prediction)")
-st.caption("แสดงผลจากไฟล์ prediction_result.csv (สีแดง = ความเสี่ยงสูง, สีน้ำเงิน = ความเสี่ยงต่ำ)")
+st.caption("ทำนายความเสี่ยงจากการ Upload ไฟล์ CSV + แปลงพิกัดอัตโนมัติ")
 
-# 5.1 Load Prediction Data
-@st.cache_data
-def load_prediction_data():
-    try:
-        # อ่านไฟล์ prediction_result.csv
-        df_pred = pd.read_csv('prediction_results.csv')
-        
-        # ตรวจสอบคอลัมน์ที่จำเป็น
-        required_pred_cols = ['latitude', 'longitude', 'reopen_probability', 'risk_level', 'ticket_id', 'type', 'district']
-        missing_cols = [col for col in required_pred_cols if col not in df_pred.columns]
-        
-        if missing_cols:
-             st.error(f"❌ ไฟล์ prediction_result.csv ขาดคอลัมน์ที่จำเป็น: {missing_cols}")
-             return pd.DataFrame()
-             
-        return df_pred
-    except FileNotFoundError:
-        st.warning("⚠️ ไม่พบไฟล์ 'prediction_result.csv' กรุณาอัปโหลดไฟล์เพื่อดูการวิเคราะห์ความเสี่ยง")
-        return pd.DataFrame()
+final_pred_df = pd.DataFrame()
 
-pred_df = load_prediction_data()
-
-# 5.2 Process & Plot Prediction Data
-if not pred_df.empty:
-    # แปลงเป็นตัวเลขและกรอง NaN
-    pred_df['latitude'] = pd.to_numeric(pred_df['latitude'], errors='coerce')
-    pred_df['longitude'] = pd.to_numeric(pred_df['longitude'], errors='coerce')
-    pred_df = pred_df.dropna(subset=['latitude', 'longitude', 'reopen_probability'])
-    
-    # --- APPLY SLIDERS HERE ---
-    # ใช้ Slider จาก Sidebar มาตัดจำนวนข้อมูล
-    pred_df = pred_df.head(n_pred_sample)
-    
-    if pred_df.empty:
-         st.warning("พบไฟล์ Prediction แต่ไม่มีข้อมูลพิกัด (Latitude/Longitude) ที่ถูกต้อง")
+if uploaded_file is not None and run_prediction:
+    if model_package is None:
+        st.error("❌ ไม่พบไฟล์โมเดล 'traffy_model_weather.pkl' ในระบบ")
     else:
-        # แสดงจำนวนข้อมูลที่กำลังพล็อต
-        st.info(f"📍 กำลังแสดงผล: {len(pred_df):,} รายการ (จากทั้งหมดในไฟล์) | ขนาดจุดสูงสุด: {pred_dot_size}px")
+        with st.spinner("☁️ กำลังประมวลผล (แปลงพิกัด + ดึงสภาพอากาศ + ทำนายผล)..."):
+            try:
+                raw_up = pd.read_csv(uploaded_file)
+                up_rename = {}
+                for k, v in REQUIRED_COLS_CONFIG.items():
+                    if v in raw_up.columns: up_rename[v] = k
+                
+                df_up = raw_up.rename(columns=up_rename)
 
-        # สร้าง Scatter Mapbox ด้วย Plotly Express
-        # ใช้ 'reopen_probability' เป็นตัวกำหนดสี (Continuous Color Scale)
-        # สีแดง (Red) = โอกาสสูง, สีน้ำเงิน (Blue) = โอกาสต่ำ (ใช้ RdBu_r reversed)
-        fig_risk = px.scatter_mapbox(
-            pred_df,
-            lat="latitude",
-            lon="longitude",
-            color="reopen_probability", # สีตามความน่าจะเป็น
-            size="reopen_probability",  # ขนาดตามความน่าจะเป็น (ยิ่งเสี่ยงยิ่งใหญ่)
-            hover_name="ticket_id",
-            hover_data={
-                "latitude": False,
-                "longitude": False,
-                "type": True,
-                "risk_level": True,
-                "district": True,
-                "reopen_probability": ":.2f" # แสดงทศนิยม 2 ตำแหน่ง
-            },
-            color_continuous_scale=px.colors.sequential.RdBu_r, # โทนสี แดง-น้ำเงิน
-            size_max=pred_dot_size, # <--- ใช้ค่าจาก Slider ขนาดจุดตรงนี้
-            zoom=10,
-            height=600,
-            title="แผนที่แสดงความเสี่ยงการถูกเปิดซ้ำ (Reopen Risk Map)"
-        )
+                if 'coords' in df_up.columns and ('latitude' not in df_up.columns or 'longitude' not in df_up.columns):
+                    try:
+                        coords_split = df_up['coords'].astype(str).str.split(',', expand=True)
+                        if coords_split.shape[1] >= 2:
+                            df_up['longitude'] = pd.to_numeric(coords_split[0], errors='coerce')
+                            df_up['latitude'] = pd.to_numeric(coords_split[1], errors='coerce')
+                            st.success(f"✅ แปลงคอลัมน์ 'coords' เป็นพิกัดสำเร็จ ({len(df_up)} แถว)")
+                    except Exception as e:
+                        st.warning(f"⚠️ พยายามแปลง coords แล้วแต่ไม่สำเร็จ: {e}")
 
-        # ตั้งค่าจุดกึ่งกลางแผนที่
-        mid_lat_pred = pred_df['latitude'].mean()
-        mid_lon_pred = pred_df['longitude'].mean()
-        fig_risk.update_layout(
-            mapbox_style="carto-positron", # ใช้แผนที่พื้นหลังแบบสว่าง
-            mapbox_center={"lat": mid_lat_pred, "lon": mid_lon_pred},
-            margin={"r":0,"t":40,"l":0,"b":0}
-        )
+                if 'latitude' not in df_up.columns:
+                    st.warning("⚠️ ไฟล์นี้ไม่มีคอลัมน์พิกัด (latitude/longitude หรือ coords) จะทำนายแต่ไม่แสดงแผนที่")
+                    
+                X_input = preprocess_for_prediction(df_up, model_package) 
+                
+                if model_package and 'model' in model_package:
+                    model = model_package['model']
+                    threshold_calc = 0.723 
+                    try:
+                        probs = model.predict_proba(X_input)[:, 1]
+                        df_up['reopen_probability'] = probs
+                        df_up['risk_level'] = df_up['reopen_probability'].apply(lambda x: 'High' if x > threshold_calc else 'Low')
+                        final_pred_df = df_up
+                    except Exception as e:
+                        st.error(f"Prediction Error: {e} (กรุณาตรวจสอบฟังก์ชัน preprocess_for_prediction)")
+                else:
+                    st.error("Model format invalid")
+                
+            except Exception as e:
+                st.error(f"เกิดข้อผิดพลาดในการอ่านไฟล์หรือทำนาย: {e}")
 
-        st.plotly_chart(fig_risk, use_container_width=True)
+# Result Display
+if not final_pred_df.empty:
+    if 'latitude' in final_pred_df.columns and 'longitude' in final_pred_df.columns:
+        pred_display = final_pred_df.head(n_pred_sample)
+        map_display = pred_display.dropna(subset=['latitude', 'longitude'])
+        
+        if 'reopen_probability' in map_display.columns:
+            map_display['adjusted_prob'] = map_display['reopen_probability'] - 0.2
+            threshold_display = 0.569
+            map_display['risk_color'] = map_display['adjusted_prob'].apply(
+                lambda x: 'สูง (High Risk)' if x > threshold_display else 'ต่ำ (Low Risk)'
+            )
+            
+            st.info(f"📍 ทำนายเสร็จสิ้น! แสดงผลบนแผนที่: {len(map_display):,} จุด | Threshold: {threshold_display:.4f}")
+            
+            if not map_display.empty:
+                fig_risk = px.scatter_mapbox(
+                    map_display,
+                    lat="latitude", lon="longitude",
+                    color="risk_color", size="reopen_probability",
+                    hover_name="ticket_id" if "ticket_id" in map_display.columns else None,
+                    hover_data={
+                        "risk_level": True, "reopen_probability": ":.2f", "risk_color": False,
+                        "district": True if 'district' in map_display.columns else False,
+                        "type": True if 'type' in map_display.columns else False
+                    },
+                    color_discrete_map={'สูง (High Risk)': '#FF4444', 'ต่ำ (Low Risk)': '#44FF44'},
+                    size_max=pred_dot_size, zoom=10, height=600,
+                    title=f"แผนที่ความเสี่ยง (แดง = เสี่ยงสูง | เขียว = เสี่ยงต่ำ)"
+                )
+                fig_risk.update_layout(
+                    mapbox_style="carto-positron",
+                    mapbox_center={"lat": map_display['latitude'].mean(), "lon": map_display['longitude'].mean()},
+                    margin={"r":0,"t":40,"l":0,"b":0}
+                )
+                st.plotly_chart(fig_risk, use_container_width=True)
+        else:
+            st.error("ไม่พบคอลัมน์ reopen_probability จากการทำนาย")
+    else:
+        st.warning("⚠️ ไม่สามารถแสดงแผนที่ได้ เนื่องจากไม่มีข้อมูล Latitude/Longitude")
 
-        # *** ส่วนแสดงตาราง Prediction ถูกลบออกแล้วตามคำขอ ***
+    st.subheader("📋 ดาวน์โหลดผลลัพธ์")
+    csv = final_pred_df.to_csv(index=False).encode('utf-8-sig')
+    st.download_button(
+        label="📥 ดาวน์โหลดผลการทำนาย (CSV)",
+        data=csv,
+        file_name="prediction_result.csv",
+        mime="text/csv"
+    )
 
-st.markdown("---")
+else:
+    st.info("👈 กรุณาอัปโหลดไฟล์ CSV ที่แถบด้านซ้าย และกดปุ่ม '🚀 เริ่มทำนายผล (Predict)'")
+    st.markdown(
+        """
+        <div style='background-color: #f8f9fa; border: 2px dashed #ccc; border-radius: 10px; padding: 60px; text-align: center; color: #888;'>
+            <h2 style='color: #ccc;'>🔮</h2>
+            <h3>พื้นที่แสดงผลการทำนาย</h3>
+            <p>รอข้อมูลจากการ Upload...</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
